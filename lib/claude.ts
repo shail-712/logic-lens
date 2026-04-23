@@ -1,8 +1,8 @@
 import type { AnalysisResult } from '../types';
 import { getApiKeyOverride } from './storage';
 
-const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
-const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'] as const;
+const GROQ_BASE_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_MODELS = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768'] as const;
 
 export const ANALYZE_LOGIC_SYSTEM_PROMPT = `You are LogicLens, an AI that evaluates algorithmic reasoning. The user has described their approach to a coding problem in plain English.
 
@@ -56,22 +56,15 @@ When shouldEnd is false:
 - "finalAssessment" must be null.`;
 
 async function resolveApiKey(): Promise<string | null> {
-  const envKey = (process.env.EXPO_PUBLIC_GEMINI_API_KEY ?? process.env.GEMINI_API_KEY ?? '').trim();
+  const envKey = (process.env.EXPO_PUBLIC_GROQ_API_KEY ?? process.env.GROQ_API_KEY ?? process.env.EXPO_PUBLIC_GEMINI_API_KEY ?? '').trim();
   if (envKey && envKey.toLowerCase() !== 'undefined') return envKey;
   const override = (await getApiKeyOverride())?.trim() ?? '';
   if (override && override.toLowerCase() !== 'undefined') return override;
   return null;
 }
 
-function extractTextFromGemini(data: any): string {
-  const parts = data?.candidates?.[0]?.content?.parts;
-  if (Array.isArray(parts)) {
-    const textBlocks = parts
-      .map((p) => (typeof p?.text === 'string' ? p.text : ''))
-      .filter(Boolean);
-    return textBlocks.join('\n').trim();
-  }
-  return '';
+function extractTextFromGroq(data: any): string {
+  return data?.choices?.[0]?.message?.content || '';
 }
 
 function extractJsonPayload(text: string): string {
@@ -79,46 +72,71 @@ function extractJsonPayload(text: string): string {
   return (fenced?.[1] ?? text).trim();
 }
 
-type GeminiBody = {
-  system_instruction: { parts: Array<{ text: string }> };
-  contents: Array<{ role: string; parts: Array<{ text: string }> }>;
-  generationConfig: {
-    maxOutputTokens: number;
-    temperature: number;
-    responseMimeType: 'application/json';
-  };
+type GroqMessage = { role: string; content: string };
+type GroqBody = {
+  model?: string;
+  messages: GroqMessage[];
+  response_format?: { type: 'json_object' };
+  temperature?: number;
+  max_tokens?: number;
 };
 
-async function requestGemini(apiKey: string, body: GeminiBody): Promise<any> {
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function requestGroq(apiKey: string, body: Omit<GroqBody, 'model'>): Promise<any> {
   let lastErrorText = '';
   let lastStatus = 0;
-  for (const model of GEMINI_MODELS) {
-    const response = await fetch(
-      `${GEMINI_BASE_URL}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
+  const MAX_RETRIES = 3;
+  const BASE_DELAY_MS = 2000;
+
+  for (const model of GROQ_MODELS) {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      // Back off before retrying (skip delay on the first attempt)
+      if (attempt > 0) {
+        await sleep(BASE_DELAY_MS * Math.pow(2, attempt - 1));
       }
-    );
 
-    if (response.ok) {
-      return response.json();
-    }
+      let response: Response;
+      try {
+        response = await fetch(GROQ_BASE_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({ ...body, model }),
+        });
+      } catch (networkErr: any) {
+        // Network-level failure (DNS, timeout, offline) — retry
+        lastErrorText = String(networkErr?.message ?? networkErr);
+        lastStatus = 0;
+        continue;
+      }
 
-    const errorText = await response.text().catch(() => '');
-    lastErrorText = errorText;
-    lastStatus = response.status;
-    // Only continue to next model on 404 (model not found). Fail fast on auth/client errors.
-    if (response.status >= 400 && response.status < 500 && response.status !== 404) {
-      throw new Error(`GEMINI_HTTP_${response.status}:${errorText}`);
+      if (response.ok) {
+        return response.json();
+      }
+
+      const errorText = await response.text().catch(() => '');
+      lastErrorText = errorText;
+      lastStatus = response.status;
+
+      // 429 (rate-limit) or 5xx (server error) — retry with backoff
+      if (response.status === 429 || response.status >= 500) {
+        continue; // will retry or fall through to next model
+      }
+
+      // 404 — model not found, skip to next model immediately
+      if (response.status === 404) {
+        break;
+      }
+
+      // Other 4xx (400, 401, 403) — fail fast, no point retrying
+      throw new Error(`GROQ_HTTP_${response.status}:${errorText}`);
     }
-    // 5xx / 429 / etc — keep trying next model
   }
 
-  throw new Error(`GEMINI_HTTP_${lastStatus || 404}:${lastErrorText}`);
+  throw new Error(`GROQ_HTTP_${lastStatus || 404}:${lastErrorText}`);
 }
 
 export async function analyzeLogic(userInput: string): Promise<AnalysisResult> {
@@ -127,16 +145,16 @@ export async function analyzeLogic(userInput: string): Promise<AnalysisResult> {
     throw new Error('MISSING_API_KEY');
   }
 
-  const data = await requestGemini(apiKey, {
-      system_instruction: { parts: [{ text: ANALYZE_LOGIC_SYSTEM_PROMPT }] },
-      contents: [{ role: 'user', parts: [{ text: userInput }] }],
-      generationConfig: {
-        maxOutputTokens: 1500,
-        temperature: 0.2,
-        responseMimeType: 'application/json',
-      },
+  const data = await requestGroq(apiKey, {
+      messages: [
+        { role: 'system', content: ANALYZE_LOGIC_SYSTEM_PROMPT },
+        { role: 'user', content: userInput },
+      ],
+      response_format: { type: 'json_object' },
+      max_tokens: 1500,
+      temperature: 0.2,
   });
-  const text = extractTextFromGemini(data);
+  const text = extractTextFromGroq(data);
   if (!text) throw new Error('EMPTY_AI_RESPONSE');
 
   try {
@@ -164,20 +182,21 @@ export async function interviewReply(
   }
 
   const history = turns.map((t) => ({
-    role: t.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: t.content }],
+    role: t.role,
+    content: t.content,
   }));
 
-  const data = await requestGemini(apiKey, {
-      system_instruction: { parts: [{ text: INTERVIEW_SYSTEM_PROMPT }] },
-      contents: [...history, { role: 'user', parts: [{ text: userMessage }] }],
-      generationConfig: {
-        maxOutputTokens: 500,
-        temperature: 0.4,
-        responseMimeType: 'application/json',
-      },
+  const data = await requestGroq(apiKey, {
+      messages: [
+        { role: 'system', content: INTERVIEW_SYSTEM_PROMPT },
+        ...history,
+        { role: 'user', content: userMessage },
+      ],
+      response_format: { type: 'json_object' },
+      max_tokens: 500,
+      temperature: 0.4,
   });
-  const text = extractTextFromGemini(data);
+  const text = extractTextFromGroq(data);
   if (!text) throw new Error('EMPTY_AI_RESPONSE');
   try {
     const parsed = JSON.parse(extractJsonPayload(text)) as InterviewReplyPayload;

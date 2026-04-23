@@ -17,9 +17,10 @@ import { useFocusEffect } from '@react-navigation/native';
 import { COLORS } from '../../constants/colors';
 import { analyzeLogic } from '../../lib/claude';
 import { getApiKeyOverride, getSessions, setApiKeyOverride } from '../../lib/storage';
+import { getRandomProblem } from '../../lib/problems';
 import { CTA_STYLE, FONT_MONO, LABEL_STYLE } from '../../lib/ui';
 import SessionRow from '../../components/SessionRow';
-import type { Session } from '../../types';
+import type { Problem, Session } from '../../types';
 
 function MicIcon({ color }: { color: string }) {
   return (
@@ -72,6 +73,15 @@ function hasWebSpeech(): boolean {
   return Boolean(w?.SpeechRecognition || w?.webkitSpeechRecognition);
 }
 
+function DifficultyPill({ difficulty }: { difficulty: Problem['difficulty'] }) {
+  const bg = difficulty === 'Easy' ? COLORS.accent : difficulty === 'Medium' ? COLORS.warning : COLORS.error;
+  return (
+    <View style={[styles.diffPill, { backgroundColor: bg }]}>
+      <Text style={styles.diffText}>{difficulty}</Text>
+    </View>
+  );
+}
+
 export default function ConsoleScreen() {
   const [input, setInput] = useState('');
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -81,6 +91,7 @@ export default function ConsoleScreen() {
   const pulse = useRef(new Animated.Value(1)).current;
   const [speechActive, setSpeechActive] = useState(false);
   const speechRef = useRef<any>(null);
+  const [problem, setProblem] = useState<Problem>(() => getRandomProblem());
 
   const canAnalyze = input.trim().length >= 20 && !loading;
   const greeting = useMemo(getGreeting, []);
@@ -122,10 +133,18 @@ export default function ConsoleScreen() {
   const openKeyModal = () => setApiModalOpen(true);
   const isKeyConfigError = (message: string) =>
     message.includes('MISSING_API_KEY') ||
-    message.includes('GEMINI_HTTP_400') ||
-    message.includes('GEMINI_HTTP_401') ||
-    message.includes('GEMINI_HTTP_403') ||
-    message.includes('GEMINI_HTTP_404');
+    message.includes('GROQ_HTTP_400') ||
+    message.includes('GROQ_HTTP_401') ||
+    message.includes('GROQ_HTTP_403') ||
+    message.includes('GROQ_HTTP_404');
+
+  const isTransientError = (message: string) =>
+    message.includes('GROQ_HTTP_429') ||
+    message.includes('GROQ_HTTP_5') ||
+    message.includes('EMPTY_AI_RESPONSE') ||
+    message.includes('network') ||
+    message.includes('Network') ||
+    message.includes('fetch');
 
   const saveKey = async () => {
     if (!apiKeyDraft.trim()) return;
@@ -161,11 +180,17 @@ export default function ConsoleScreen() {
     rec.start();
   };
 
+  const shuffleProblem = () => {
+    setProblem(getRandomProblem());
+  };
+
   const onAnalyze = async () => {
     if (!canAnalyze) return;
     setLoading(true);
     try {
-      const result = await analyzeLogic(input.trim());
+      // Prepend the problem context so the LLM knows which question the user is answering
+      const fullInput = `Problem: ${problem.title} (${problem.difficulty}) — ${problem.description}\n\nMy approach:\n${input.trim()}`;
+      const result = await analyzeLogic(fullInput);
       router.push({
         pathname: '/analysis',
         params: { payload: JSON.stringify({ userInput: input.trim(), result }) },
@@ -175,8 +200,13 @@ export default function ConsoleScreen() {
       const msg = String(e?.message ?? e);
       if (isKeyConfigError(msg)) {
         openKeyModal();
+      } else if (isTransientError(msg)) {
+        Alert.alert(
+          'Server busy',
+          'The Groq API is rate-limited or temporarily unavailable (429/503). Please wait a few seconds and try again.'
+        );
       } else {
-        Alert.alert('Analysis failed', 'Try again.');
+        Alert.alert('Analysis failed', 'Something went wrong. Please try again in a moment.');
       }
     } finally {
       setLoading(false);
@@ -186,9 +216,32 @@ export default function ConsoleScreen() {
   return (
     <View style={styles.screen}>
       <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
-        <Text style={styles.greeting}>{greeting}</Text>
+        {/* Back button to landing page */}
+        <View style={styles.headerRow}>
+          <Pressable onPress={() => router.replace('/')} style={styles.backBtn} hitSlop={10}>
+            <Text style={styles.backBtnText}>{'← HOME'}</Text>
+          </Pressable>
+          <Text style={styles.greeting}>{greeting}</Text>
+        </View>
         <View style={styles.sep} />
 
+        {/* Problem question card */}
+        <View style={styles.problemCard}>
+          <View style={styles.problemHeader}>
+            <Text style={styles.problemLabel}>CURRENT QUESTION</Text>
+            <Pressable onPress={shuffleProblem} style={styles.shuffleBtn}>
+              <Text style={styles.shuffleText}>↻ SHUFFLE</Text>
+            </Pressable>
+          </View>
+          <View style={styles.problemTop}>
+            <DifficultyPill difficulty={problem.difficulty} />
+            <Text style={styles.problemCategory}>{problem.category.toUpperCase()}</Text>
+          </View>
+          <Text style={styles.problemTitle}>{problem.title}</Text>
+          <Text style={styles.problemDesc}>{problem.description}</Text>
+        </View>
+
+        <Text style={styles.answerLabel}>YOUR APPROACH</Text>
         <View style={styles.inputWrap}>
           <TextInput
             value={input}
@@ -243,12 +296,12 @@ export default function ConsoleScreen() {
           <View style={styles.modalCard}>
             <Text style={styles.modalLabel}>API KEY REQUIRED</Text>
             <Text style={styles.modalBody}>
-              Paste your Gemini key to enable analysis + interview mode.
+              Paste your Groq key to enable analysis + interview mode.
             </Text>
             <TextInput
               value={apiKeyDraft}
               onChangeText={setApiKeyDraft}
-              placeholder="AIza..."
+              placeholder="gsk_..."
               placeholderTextColor={COLORS.textSecondary}
               autoCapitalize="none"
               autoCorrect={false}
@@ -275,12 +328,99 @@ export default function ConsoleScreen() {
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: COLORS.bgPrimary },
   scroll: { paddingHorizontal: 18, paddingTop: 18, paddingBottom: 10 },
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  backBtn: {
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 4,
+    backgroundColor: COLORS.bgSecondary,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  backBtnText: {
+    ...LABEL_STYLE,
+    color: COLORS.textPrimary,
+  },
   greeting: {
     color: COLORS.textSecondary,
     fontFamily: FONT_MONO,
     fontSize: 14,
+    flex: 1,
   },
   sep: { height: 1, backgroundColor: COLORS.border, marginTop: 12, marginBottom: 16 },
+  // Problem card
+  problemCard: {
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 4,
+    backgroundColor: COLORS.bgSecondary,
+    padding: 14,
+    marginBottom: 16,
+  },
+  problemHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+  problemLabel: {
+    ...LABEL_STYLE,
+    color: COLORS.accent,
+  },
+  shuffleBtn: {
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 4,
+    backgroundColor: COLORS.bgTertiary,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  shuffleText: {
+    ...LABEL_STYLE,
+    color: COLORS.textPrimary,
+  },
+  problemTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 8,
+  },
+  diffPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+  },
+  diffText: {
+    ...LABEL_STYLE,
+    color: '#000000',
+    fontWeight: '900',
+  },
+  problemCategory: {
+    ...LABEL_STYLE,
+    color: COLORS.textMuted,
+  },
+  problemTitle: {
+    color: COLORS.textPrimary,
+    fontFamily: FONT_MONO,
+    fontSize: 18,
+    fontWeight: '800',
+    marginBottom: 6,
+  },
+  problemDesc: {
+    color: COLORS.textSecondary,
+    fontFamily: FONT_MONO,
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  answerLabel: {
+    ...LABEL_STYLE,
+    color: COLORS.textSecondary,
+    marginBottom: 8,
+  },
   inputWrap: {
     position: 'relative',
     borderWidth: 1,
@@ -406,4 +546,3 @@ const styles = StyleSheet.create({
   modalBtnTextGhost: { color: COLORS.textPrimary },
   modalBtnTextSolid: { color: '#000000' },
 });
-

@@ -48,15 +48,15 @@ export default function InterviewScreen() {
 
   const isMissingKeyError = (message: string) =>
     message.includes('MISSING_API_KEY') ||
-    message.includes('GEMINI_HTTP_400') ||
-    message.includes('GEMINI_HTTP_401') ||
-    message.includes('GEMINI_HTTP_403');
+    message.includes('GROQ_HTTP_400') ||
+    message.includes('GROQ_HTTP_401') ||
+    message.includes('GROQ_HTTP_403');
 
-  const isGeminiUnavailableError = (message: string) => message.includes('GEMINI_HTTP_404');
+  const isGeminiUnavailableError = (message: string) => message.includes('GROQ_HTTP_404');
 
   const isTransientError = (message: string) =>
-    message.includes('GEMINI_HTTP_429') ||
-    message.includes('GEMINI_HTTP_5') ||
+    message.includes('GROQ_HTTP_429') ||
+    message.includes('GROQ_HTTP_5') ||
     message.includes('EMPTY_AI_RESPONSE') ||
     message.includes('network') ||
     message.includes('Network') ||
@@ -64,10 +64,10 @@ export default function InterviewScreen() {
 
   const buildErrorFallback = (message: string) => {
     if (isMissingKeyError(message)) {
-      return 'Invalid or missing Gemini API key. Update your key and press Retry Interviewer.';
+      return 'Invalid or missing Groq API key. Update your key and press Retry Interviewer.';
     }
     if (isGeminiUnavailableError(message)) {
-      return 'Gemini endpoint unavailable for this key/project. Re-save a valid Gemini key and press Retry Interviewer.';
+      return 'Groq endpoint unavailable for this key/project. Re-save a valid Groq key and press Retry Interviewer.';
     }
     if (isTransientError(message)) {
       return 'Interviewer is temporarily unavailable (server busy or rate limited). Press Retry Interviewer in a few seconds.';
@@ -116,7 +116,7 @@ export default function InterviewScreen() {
     if (!apiKeyDraft.trim()) return;
     await setApiKeyOverride(apiKeyDraft.trim());
     setApiModalOpen(false);
-    if (!turns.length || turns[turns.length - 1]?.content.includes('Invalid or missing Gemini API key')) {
+    if (!turns.length || turns[turns.length - 1]?.content.includes('Invalid or missing Groq API key')) {
       askOpeningQuestion(problem);
     }
   };
@@ -328,11 +328,11 @@ export default function InterviewScreen() {
         <View style={styles.modalBackdrop}>
           <View style={styles.modalCard}>
             <Text style={styles.modalLabel}>API KEY REQUIRED</Text>
-            <Text style={styles.modalBody}>Paste a valid Gemini API key to continue.</Text>
+            <Text style={styles.modalBody}>Paste a valid Groq API key to continue.</Text>
             <TextInput
               value={apiKeyDraft}
               onChangeText={setApiKeyDraft}
-              placeholder="AIza..."
+              placeholder="gsk_..."
               placeholderTextColor={COLORS.textSecondary}
               autoCapitalize="none"
               autoCorrect={false}
