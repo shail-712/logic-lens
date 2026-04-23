@@ -120,6 +120,12 @@ export default function ConsoleScreen() {
   }, []);
 
   const openKeyModal = () => setApiModalOpen(true);
+  const isKeyConfigError = (message: string) =>
+    message.includes('MISSING_API_KEY') ||
+    message.includes('GEMINI_HTTP_400') ||
+    message.includes('GEMINI_HTTP_401') ||
+    message.includes('GEMINI_HTTP_403') ||
+    message.includes('GEMINI_HTTP_404');
 
   const saveKey = async () => {
     if (!apiKeyDraft.trim()) return;
@@ -167,7 +173,7 @@ export default function ConsoleScreen() {
       setInput('');
     } catch (e: any) {
       const msg = String(e?.message ?? e);
-      if (msg.includes('MISSING_API_KEY')) {
+      if (isKeyConfigError(msg)) {
         openKeyModal();
       } else {
         Alert.alert('Analysis failed', 'Try again.');

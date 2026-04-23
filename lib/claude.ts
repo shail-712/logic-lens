@@ -1,7 +1,8 @@
 import type { AnalysisResult } from '../types';
 import { getApiKeyOverride } from './storage';
 
-const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent';
+const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
+const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'] as const;
 
 export const ANALYZE_LOGIC_SYSTEM_PROMPT = `You are LogicLens, an AI that evaluates algorithmic reasoning. The user has described their approach to a coding problem in plain English.
 
@@ -55,10 +56,11 @@ When shouldEnd is false:
 - "finalAssessment" must be null.`;
 
 async function resolveApiKey(): Promise<string | null> {
-  const override = await getApiKeyOverride();
-  if (override) return override;
-  const envKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY ?? process.env.GEMINI_API_KEY;
-  return envKey?.trim() ? envKey : null;
+  const envKey = (process.env.EXPO_PUBLIC_GEMINI_API_KEY ?? process.env.GEMINI_API_KEY ?? '').trim();
+  if (envKey && envKey.toLowerCase() !== 'undefined') return envKey;
+  const override = (await getApiKeyOverride())?.trim() ?? '';
+  if (override && override.toLowerCase() !== 'undefined') return override;
+  return null;
 }
 
 function extractTextFromGemini(data: any): string {
@@ -77,18 +79,55 @@ function extractJsonPayload(text: string): string {
   return (fenced?.[1] ?? text).trim();
 }
 
+type GeminiBody = {
+  system_instruction: { parts: Array<{ text: string }> };
+  contents: Array<{ role: string; parts: Array<{ text: string }> }>;
+  generationConfig: {
+    maxOutputTokens: number;
+    temperature: number;
+    responseMimeType: 'application/json';
+  };
+};
+
+async function requestGemini(apiKey: string, body: GeminiBody): Promise<any> {
+  let lastErrorText = '';
+  let lastStatus = 0;
+  for (const model of GEMINI_MODELS) {
+    const response = await fetch(
+      `${GEMINI_BASE_URL}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      }
+    );
+
+    if (response.ok) {
+      return response.json();
+    }
+
+    const errorText = await response.text().catch(() => '');
+    lastErrorText = errorText;
+    lastStatus = response.status;
+    // Only continue to next model on 404 (model not found). Fail fast on auth/client errors.
+    if (response.status >= 400 && response.status < 500 && response.status !== 404) {
+      throw new Error(`GEMINI_HTTP_${response.status}:${errorText}`);
+    }
+    // 5xx / 429 / etc — keep trying next model
+  }
+
+  throw new Error(`GEMINI_HTTP_${lastStatus || 404}:${lastErrorText}`);
+}
+
 export async function analyzeLogic(userInput: string): Promise<AnalysisResult> {
   const apiKey = await resolveApiKey();
   if (!apiKey) {
     throw new Error('MISSING_API_KEY');
   }
 
-  const response = await fetch(`${GEMINI_URL}?key=${encodeURIComponent(apiKey)}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
+  const data = await requestGemini(apiKey, {
       system_instruction: { parts: [{ text: ANALYZE_LOGIC_SYSTEM_PROMPT }] },
       contents: [{ role: 'user', parts: [{ text: userInput }] }],
       generationConfig: {
@@ -96,15 +135,7 @@ export async function analyzeLogic(userInput: string): Promise<AnalysisResult> {
         temperature: 0.2,
         responseMimeType: 'application/json',
       },
-    }),
   });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(`GEMINI_HTTP_${response.status}:${body}`);
-  }
-
-  const data = await response.json();
   const text = extractTextFromGemini(data);
   if (!text) throw new Error('EMPTY_AI_RESPONSE');
 
@@ -137,12 +168,7 @@ export async function interviewReply(
     parts: [{ text: t.content }],
   }));
 
-  const response = await fetch(`${GEMINI_URL}?key=${encodeURIComponent(apiKey)}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
+  const data = await requestGemini(apiKey, {
       system_instruction: { parts: [{ text: INTERVIEW_SYSTEM_PROMPT }] },
       contents: [...history, { role: 'user', parts: [{ text: userMessage }] }],
       generationConfig: {
@@ -150,15 +176,7 @@ export async function interviewReply(
         temperature: 0.4,
         responseMimeType: 'application/json',
       },
-    }),
   });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(`GEMINI_HTTP_${response.status}:${body}`);
-  }
-
-  const data = await response.json();
   const text = extractTextFromGemini(data);
   if (!text) throw new Error('EMPTY_AI_RESPONSE');
   try {

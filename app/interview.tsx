@@ -17,7 +17,7 @@ import { getApiKeyOverride, setApiKeyOverride } from '../lib/storage';
 import { CTA_STYLE, FONT_MONO, LABEL_STYLE } from '../lib/ui';
 import type { Problem } from '../types';
 
-const MAX_TURNS = 8;
+const TOTAL_QUESTIONS = 3;
 
 function DifficultyPill({ difficulty }: { difficulty: Problem['difficulty'] }) {
   const bg = difficulty === 'Easy' ? COLORS.accent : difficulty === 'Medium' ? COLORS.warning : COLORS.error;
@@ -41,9 +41,39 @@ export default function InterviewScreen() {
   const typingRef = useRef<any>(null);
   const [apiModalOpen, setApiModalOpen] = useState(false);
   const [apiKeyDraft, setApiKeyDraft] = useState('');
+  const [statusText, setStatusText] = useState('');
 
   const userTurns = useMemo(() => turns.filter((t) => t.role === 'user').length, [turns]);
-  const finished = interviewEnded || userTurns >= MAX_TURNS;
+  const finished = interviewEnded || userTurns >= TOTAL_QUESTIONS;
+
+  const isMissingKeyError = (message: string) =>
+    message.includes('MISSING_API_KEY') ||
+    message.includes('GEMINI_HTTP_400') ||
+    message.includes('GEMINI_HTTP_401') ||
+    message.includes('GEMINI_HTTP_403');
+
+  const isGeminiUnavailableError = (message: string) => message.includes('GEMINI_HTTP_404');
+
+  const isTransientError = (message: string) =>
+    message.includes('GEMINI_HTTP_429') ||
+    message.includes('GEMINI_HTTP_5') ||
+    message.includes('EMPTY_AI_RESPONSE') ||
+    message.includes('network') ||
+    message.includes('Network') ||
+    message.includes('fetch');
+
+  const buildErrorFallback = (message: string) => {
+    if (isMissingKeyError(message)) {
+      return 'Invalid or missing Gemini API key. Update your key and press Retry Interviewer.';
+    }
+    if (isGeminiUnavailableError(message)) {
+      return 'Gemini endpoint unavailable for this key/project. Re-save a valid Gemini key and press Retry Interviewer.';
+    }
+    if (isTransientError(message)) {
+      return 'Interviewer is temporarily unavailable (server busy or rate limited). Press Retry Interviewer in a few seconds.';
+    }
+    return 'Interviewer is temporarily unavailable. Press Retry Interviewer in a few seconds.';
+  };
 
   useEffect(() => {
     (async () => {
@@ -52,10 +82,43 @@ export default function InterviewScreen() {
     })();
   }, []);
 
+  const askOpeningQuestion = async (currentProblem: Problem) => {
+    setLoading(true);
+    setStatusText('Connecting interviewer...');
+    setTyped('');
+    try {
+      const payload: InterviewReplyPayload = await interviewReply(
+        [],
+        [
+          `Problem: ${currentProblem.title} (${currentProblem.difficulty})`,
+          `Prompt: ${currentProblem.description}`,
+          `This is question 1 of ${TOTAL_QUESTIONS}.`,
+          'Start the interview now. Ask exactly one concise opening question about approach, correctness, or complexity.',
+        ].join('\n')
+      );
+      const openingText =
+        payload.reply?.trim() || 'Walk me through your approach and expected time-space complexity.';
+      setTurns([{ role: 'assistant', content: openingText }]);
+      typewriter(openingText);
+    } catch (e: any) {
+      const m = String(e?.message ?? e);
+      if (isMissingKeyError(m) || isGeminiUnavailableError(m)) setApiModalOpen(true);
+      const fallback = buildErrorFallback(m);
+      setTurns([{ role: 'assistant', content: fallback }]);
+      setTyped(fallback);
+    } finally {
+      setStatusText('');
+      setLoading(false);
+    }
+  };
+
   const saveKey = async () => {
     if (!apiKeyDraft.trim()) return;
     await setApiKeyOverride(apiKeyDraft.trim());
     setApiModalOpen(false);
+    if (!turns.length || turns[turns.length - 1]?.content.includes('Invalid or missing Gemini API key')) {
+      askOpeningQuestion(problem);
+    }
   };
 
   const stopTyping = () => {
@@ -78,44 +141,77 @@ export default function InterviewScreen() {
     return () => stopTyping();
   }, []);
 
+  useEffect(() => {
+    askOpeningQuestion(problem);
+    // Run once for initial problem.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const onSubmit = async () => {
     if (loading || finished) return;
     const msg = input.trim();
-    if (msg.length < 10) return;
+    if (msg.length < 10) {
+      Alert.alert('Answer too short', 'Please add more detail before submitting.');
+      return;
+    }
     setInput('');
     setLoading(true);
+    setStatusText('Interviewer is thinking...');
     setTyped('');
     try {
-      const payload: InterviewReplyPayload = await interviewReply(turns, [
-        `Problem: ${problem.title} (${problem.difficulty})`,
-        `Prompt: ${problem.description}`,
-        `Candidate answer: ${msg}`,
-      ].join('\n'));
-      const assistantText = payload.reply?.trim() || 'Please continue and explain your approach in more detail.';
-      const next: InterviewTurn[] = [
-        ...turns,
-        { role: 'user', content: msg },
-        { role: 'assistant', content: assistantText },
-      ];
+      const nextUserCount = userTurns + 1;
+      const baseTurns: InterviewTurn[] = [...turns, { role: 'user', content: msg }];
+
+      const payload: InterviewReplyPayload = await interviewReply(
+        baseTurns,
+        [
+          `Problem: ${problem.title} (${problem.difficulty})`,
+          `Prompt: ${problem.description}`,
+          `Candidate answer #${nextUserCount} of ${TOTAL_QUESTIONS}: ${msg}`,
+          nextUserCount >= TOTAL_QUESTIONS
+            ? [
+                `This was the final answer (${TOTAL_QUESTIONS}/${TOTAL_QUESTIONS}).`,
+                'End interview now.',
+                'Return shouldEnd=true, include score, include finalAssessment, and a short closing line in reply.',
+              ].join('\n')
+            : [
+                `Continue interview. Ask exactly one concise follow-up question.`,
+                `Next question number must be ${nextUserCount + 1} of ${TOTAL_QUESTIONS}.`,
+                'Do not end interview yet.',
+              ].join('\n'),
+        ].join('\n')
+      );
+
+      const assistantText =
+        payload.reply?.trim() ||
+        (nextUserCount >= TOTAL_QUESTIONS
+          ? 'Thanks, that concludes the interview.'
+          : 'Please continue and explain your approach in more detail.');
+      const next: InterviewTurn[] = [...baseTurns, { role: 'assistant', content: assistantText }];
       setTurns(next);
       typewriter(assistantText);
-      if (payload.shouldEnd) {
+
+      if (nextUserCount >= TOTAL_QUESTIONS || payload.shouldEnd) {
         setInterviewEnded(true);
-        setFinalScore(payload.score ?? null);
-        setFinalAssessment(payload.finalAssessment ?? 'Interview complete.');
-      } else if (next.filter((t) => t.role === 'user').length >= MAX_TURNS) {
-        setInterviewEnded(true);
-        setFinalScore(payload.score ?? 70);
         setFinalAssessment(
           payload.finalAssessment ??
-            'Interview ended at turn limit. Your reasoning is directionally correct; tighten complexity explanation and edge-case handling.'
+            'Interview complete. Your reasoning is directionally correct; tighten complexity and edge-case handling.'
         );
+        setFinalScore(payload.score ?? 70);
       }
     } catch (e: any) {
       const m = String(e?.message ?? e);
-      if (m.includes('MISSING_API_KEY')) setApiModalOpen(true);
-      else Alert.alert('Interview failed', 'Try again.');
+      if (isMissingKeyError(m) || isGeminiUnavailableError(m)) setApiModalOpen(true);
+      const fallback = buildErrorFallback(m);
+      const next: InterviewTurn[] = [
+        ...turns,
+        { role: 'user', content: msg },
+        { role: 'assistant', content: fallback },
+      ];
+      setTurns(next);
+      typewriter(fallback);
     } finally {
+      setStatusText('');
       setLoading(false);
     }
   };
@@ -128,7 +224,10 @@ export default function InterviewScreen() {
     setInterviewEnded(false);
     setFinalScore(null);
     setFinalAssessment('');
-    setProblem(getRandomProblem());
+    const nextProblem = getRandomProblem();
+    setProblem(nextProblem);
+    setStatusText('');
+    askOpeningQuestion(nextProblem);
   };
 
   const lastAssistant = useMemo(() => {
@@ -163,6 +262,7 @@ export default function InterviewScreen() {
         </View>
 
         <Text style={styles.section}>EXPLAIN YOUR APPROACH</Text>
+        <Text style={styles.progressText}>ANSWER {Math.min(userTurns + 1, TOTAL_QUESTIONS)} OF {TOTAL_QUESTIONS}</Text>
         <View style={styles.inputWrap}>
           <TextInput
             value={input}
@@ -194,6 +294,12 @@ export default function InterviewScreen() {
           </View>
         )}
 
+        {statusText ? (
+          <View style={styles.statusRow}>
+            <Text style={styles.statusText}>{statusText}</Text>
+          </View>
+        ) : null}
+
         {finished ? (
           <View style={styles.finalCard}>
             <Text style={styles.finalLabel}>FINAL ASSESSMENT</Text>
@@ -205,6 +311,15 @@ export default function InterviewScreen() {
         <Pressable onPress={onNext} style={styles.nextBtn}>
           <Text style={styles.nextText}>NEXT QUESTION</Text>
         </Pressable>
+        {!finished ? (
+          <Pressable
+            onPress={() => askOpeningQuestion(problem)}
+            disabled={loading}
+            style={[styles.nextBtn, loading && { opacity: 0.45 }]}
+          >
+            <Text style={styles.nextText}>RETRY INTERVIEWER</Text>
+          </Pressable>
+        ) : null}
 
         <View style={{ height: 26 }} />
       </ScrollView>
@@ -213,7 +328,7 @@ export default function InterviewScreen() {
         <View style={styles.modalBackdrop}>
           <View style={styles.modalCard}>
             <Text style={styles.modalLabel}>API KEY REQUIRED</Text>
-            <Text style={styles.modalBody}>Paste your Gemini key to continue.</Text>
+            <Text style={styles.modalBody}>Paste a valid Gemini API key to continue.</Text>
             <TextInput
               value={apiKeyDraft}
               onChangeText={setApiKeyDraft}
@@ -285,6 +400,7 @@ const styles = StyleSheet.create({
   problemDesc: { marginTop: 10, color: COLORS.textSecondary, fontFamily: FONT_MONO, fontSize: 13, lineHeight: 18 },
   promptLabel: { marginTop: 12, ...LABEL_STYLE, color: COLORS.textMuted },
   section: { marginTop: 16, ...LABEL_STYLE, color: COLORS.textSecondary },
+  progressText: { marginTop: 8, ...LABEL_STYLE, color: COLORS.accent },
   inputWrap: {
     marginTop: 10,
     borderWidth: 1,
@@ -319,6 +435,8 @@ const styles = StyleSheet.create({
   },
   aiLabel: { ...LABEL_STYLE, color: COLORS.accent },
   aiText: { marginTop: 10, color: COLORS.textPrimary, fontFamily: FONT_MONO, fontSize: 13, lineHeight: 18 },
+  statusRow: { marginTop: 10, paddingHorizontal: 2 },
+  statusText: { ...LABEL_STYLE, color: COLORS.textMuted },
   nextBtn: { marginTop: 16, borderWidth: 1, borderColor: COLORS.border, paddingVertical: 12, alignItems: 'center' },
   nextText: { ...CTA_STYLE, color: COLORS.textPrimary, fontWeight: '800' },
   finalCard: {
